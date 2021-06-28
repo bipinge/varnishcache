@@ -263,25 +263,67 @@ vcc_ErrWhere(struct vcc *tl, const struct token *t)
 
 /*--------------------------------------------------------------------*/
 
-struct token *
-vcc_PeekTokenFrom(const struct vcc *tl, const struct token *t)
+static struct token *
+vcc_next_token_from(struct vcc *tl, const struct token *t, unsigned peek)
 {
 	struct token *t2;
 
 	CHECK_OBJ_NOTNULL(tl, VCC_MAGIC);
 	AN(t);
 	assert(t->tok != EOI);
+
 	t2 = VTAILQ_NEXT(t, list);
 	AN(t2);
+
+	/* ignore intrinsic tokens */
+	while (peek && t2->b == NULL) {
+		t2 = VTAILQ_NEXT(t2, list);
+		AN(t2);
+	}
+
+	/* process intrinsic tokens */
+	while (!peek && t2->b == NULL) {
+		switch (t2->tok) {
+		case INC_PUSH:
+			vcc_IncludePush(tl, t2);
+			break;
+		case INC_POP:
+			vcc_IncludePop(tl, t2);
+			break;
+		default:
+			WRONG("invalid intrinsic token");
+		}
+		t2 = VTAILQ_NEXT(t2, list);
+		AN(t2);
+	}
+
 	return (t2);
 }
 
 struct token *
-vcc_PeekToken(const struct vcc *tl)
+vcc_PeekTokenFrom(struct vcc *tl, const struct token *t)
 {
 
 	CHECK_OBJ_NOTNULL(tl, VCC_MAGIC);
-	return (vcc_PeekTokenFrom(tl, tl->t));
+	AN(t);
+	return (vcc_next_token_from(tl, t, 1));
+}
+
+struct token *
+vcc_PeekToken(struct vcc *tl)
+{
+
+	CHECK_OBJ_NOTNULL(tl, VCC_MAGIC);
+	return (vcc_next_token_from(tl, tl->t, 1));
+}
+
+struct token *
+vcc_NextTokenFrom(struct vcc *tl, const struct token *t)
+{
+
+	CHECK_OBJ_NOTNULL(tl, VCC_MAGIC);
+	AN(t);
+	return (vcc_next_token_from(tl, t, 0));
 }
 
 void
@@ -289,7 +331,7 @@ vcc_NextToken(struct vcc *tl)
 {
 
 	CHECK_OBJ_NOTNULL(tl, VCC_MAGIC);
-	tl->t = vcc_PeekTokenFrom(tl, tl->t);
+	tl->t = vcc_next_token_from(tl, tl->t, 0);
 }
 
 void
@@ -326,8 +368,7 @@ vcc_IdIs(const struct token *t, const char *p)
  */
 
 void
-vcc_PrintTokens(const struct vcc *tl,
-    const struct token *tb, const struct token *te)
+vcc_PrintTokens(struct vcc *tl, const struct token *tb, const struct token *te)
 {
 
 	CHECK_OBJ_NOTNULL(tl, VCC_MAGIC);
@@ -402,7 +443,7 @@ vcc_addtoken(struct vcc *tl, unsigned tok,
 	struct token *t;
 
 	t = TlAlloc(tl, sizeof *t);
-	assert(t != NULL);
+	AN(t);
 	t->tok = tok;
 	t->b = b;
 	t->e = e;
@@ -520,6 +561,9 @@ vcc_Lexer(struct vcc *tl, struct source *sp)
 	unsigned u;
 	struct vsb *vsb;
 	char namebuf[40];
+
+	if (sp->parent != NULL)
+		vcc_addtoken(tl, INC_PUSH, sp, NULL, NULL);
 
 	for (p = sp->b; p < sp->e; ) {
 
@@ -670,5 +714,8 @@ vcc_Lexer(struct vcc *tl, struct source *sp)
 		vcc_ErrWhere(tl, tl->t);
 		return;
 	}
+
+	if (sp->parent != NULL)
+		vcc_addtoken(tl, INC_POP, sp, NULL, NULL);
 	vcc_addtoken(tl, EOI, sp, sp->e, sp->e);
 }

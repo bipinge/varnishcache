@@ -185,6 +185,7 @@ vcc_new_symbol(struct vcc *tl, struct symtab *st,
 {
 	struct symbol *sym;
 
+	assert(vlo <= vhi);
 	sym = TlAlloc(tl, sizeof *sym);
 	INIT_OBJ(sym, SYMBOL_MAGIC);
 	AN(sym);
@@ -205,6 +206,7 @@ vcc_sym_in_tab(struct vcc *tl, struct symtab *st,
 	const struct symtab *pst;
 	struct symbol *sym, *psym;
 
+	assert(vlo <= vhi);
 	VTAILQ_FOREACH(sym, &st->symbols, list) {
 		if (sym->lorev > vhi || sym->hirev < vlo)
 			continue;
@@ -287,16 +289,16 @@ VCC_SymbolGet(struct vcc *tl, vcc_ns_t ns, vcc_kind_t kind,
 	tn = tl->t;
 	while (1) {
 		st = vcc_symtab_str(st, tn->b, tn->e);
-		sym2 = vcc_sym_in_tab(tl, st, kind, tl->syntax, tl->syntax);
+		sym2 = vcc_sym_in_tab(tl, st, kind, tl->esyntax, tl->syntax);
 		if (sym2 != NULL) {
 			sym = sym2;
 			st2 = st;
 			tn2 = tn;
 		}
-		tn1 = vcc_PeekTokenFrom(tl, tn);
+		tn1 = vcc_NextTokenFrom(tl, tn);
 		if (tn1 == NULL || tn1->tok != '.')
 			break;
-		tn1 = vcc_PeekTokenFrom(tl, tn1);
+		tn1 = vcc_NextTokenFrom(tl, tn1);
 		if (tn1 == NULL || tn1->tok != ID)
 			break;
 		tn = tn1;
@@ -314,8 +316,8 @@ VCC_SymbolGet(struct vcc *tl, vcc_ns_t ns, vcc_kind_t kind,
 	AN(st);
 	AN(tn);
 	if (sym == NULL && e == SYMTAB_CREATE)
-		sym = vcc_new_symbol(tl, st, kind, tl->syntax, tl->syntax);
-	tl->t = vcc_PeekTokenFrom(tl, tn);
+		sym = vcc_new_symbol(tl, st, kind, tl->esyntax, tl->syntax);
+	tl->t = vcc_NextTokenFrom(tl, tn);
 	if (tl->err)
 		return (NULL);
 	if (sym == NULL) {

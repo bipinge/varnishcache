@@ -385,7 +385,7 @@ EmitCoordinates(const struct vcc *tl, struct vsb *vsb)
 	sp = 0;
 	p = NULL;
 	VTAILQ_FOREACH(t, &tl->tokens, list) {
-		if (t->cnt == 0)
+		if (t->b == NULL || t->cnt == 0)
 			continue;
 		assert(t->src != NULL);
 		if (t->src != sp) {
@@ -822,6 +822,7 @@ VCC_New(void)
 
 	ALLOC_OBJ(tl, VCC_MAGIC);
 	AN(tl);
+	VTAILQ_INIT(&tl->vcl_syntax);
 	VTAILQ_INIT(&tl->inifin);
 	VTAILQ_INIT(&tl->tokens);
 	VTAILQ_INIT(&tl->sources);
