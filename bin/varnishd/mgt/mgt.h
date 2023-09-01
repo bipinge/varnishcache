@@ -71,7 +71,9 @@ extern const char * const builtin_vcl;
 /* mgt_acceptor.c */
 
 void MAC_Arg(const char *);
+void MAC_close_sockets(void);
 int MAC_reopen_sockets(void);
+int MAC_smuggle_sockets(void);
 
 /* mgt_child.c */
 void MCH_Init(void);
@@ -99,6 +101,12 @@ void mgt_DumpRstCli(void);
 void mgt_cli_init_cls(void);
 #define MCF_NOAUTH	0	/* NB: zero disables here-documents */
 #define MCF_AUTH	16
+
+/* mgt_smuggler.c */
+int mgt_SMUG_Init(void);
+void mgt_SMUG_Fini(void);
+int mgt_SMUG_Cancel(uint64_t nonce);
+uint64_t mgt_smuggle(int fd);
 
 /* mgt_jail.c */
 
@@ -221,6 +229,9 @@ extern const char *mgt_stv_h2_rxbuf;
 void STV_Config(const char *spec);
 void STV_Config_Final(void);
 void STV_Init(void);
+
+/* mgt_traffic.c */
+void TRF_Init(void);
 
 /* mgt_vcc.c */
 void mgt_DumpBuiltin(void);

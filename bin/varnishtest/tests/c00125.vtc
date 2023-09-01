@@ -1,0 +1,172 @@
+varnishtest "traffic.accept coverage"
+
+varnish v1 -vcl {
+	import vtc;
+
+	backend be none;
+
+	sub vcl_recv {
+		if (req.http.barrier) {
+			vtc.barrier_sync(req.http.barrier);
+		}
+		if (req.http.barrier2) {
+			vtc.barrier_sync(req.http.barrier2);
+		}
+		return (synth(200));
+	}
+} -start
+
+# CLI
+
+varnish v1 -cliexpect "Traffic accepted" "traffic.status"
+varnish v1 -cliexpect {"traffic": true}  "traffic.status -j"
+varnish v1 -clijson "traffic.status -j"
+
+varnish v1 -cliok traffic.refuse
+varnish v1 -cliexpect "Traffic refused"  "traffic.status"
+varnish v1 -cliexpect {"traffic": false} "traffic.status -j"
+varnish v1 -clijson "traffic.status -j"
+
+varnish v1 -cliexpect "Not accepting traffic"  "debug.listen_address"
+
+# acceptor
+
+varnish v1 -cliok traffic.accept
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.status == 200
+} -run
+
+varnish v1 -cliok traffic.refuse
+
+varnish v2 -cliok "param.set connect_timeout 1"
+varnish v2 -vcl {
+	backend v1 {
+		.host = "${v1_sock}";
+	}
+
+	sub vcl_recv {
+		return (pass);
+	}
+} -start
+
+client c2 -connect "${v2_sock}" {
+	txreq
+	rxresp
+	expect resp.status == 503
+} -run
+
+varnish v2 -stop
+
+server s2 -listen "${v1_sock}" {
+	accept
+} -start
+
+varnish v1 -clierr 300 traffic.accept
+
+server s2 -break
+
+varnish v1 -expect MAIN.sc_traffic_refuse == 0
+
+# http/1 keep-alive
+
+varnish v1 -cliok traffic.accept
+varnish v1 -cliok "param.set timeout_idle 3600"
+
+barrier b1 sock 2
+barrier b2 sock 2
+
+client c3 {
+	txreq -hdr "barrier: ${b1_sock}" -hdr "barrier2: ${b2_sock}"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.connection == close
+
+	expect_close
+} -start
+
+barrier b1 sync
+varnish v1 -cliok traffic.refuse
+barrier b2 sync
+
+client c3 -wait
+
+varnish v1 -expect MAIN.sc_traffic_refuse == 1
+
+# h2 goaway
+
+delay 0.1
+varnish v1 -cliok traffic.accept
+varnish v1 -cliok "param.set feature +http2"
+
+barrier b3 sock 2
+barrier b4 cond 2
+barrier b5 sock 2
+
+client c4 {
+	stream 1 {
+		txreq -hdr barrier ${b3_sock} -hdr barrier2 ${b5_sock}
+		rxresp
+		expect resp.status == 200
+	} -start
+
+	barrier b4 sync
+
+	stream 0 {
+		rxgoaway
+	} -start
+
+	stream 3 {
+		txreq
+		rxrst
+		expect rst.err == REFUSED_STREAM
+	} -run
+
+	barrier b5 sync
+
+	stream 0 -wait
+	stream 1 -wait
+} -start
+
+barrier b3 sync
+varnish v1 -cliok traffic.refuse
+barrier b4 sync
+
+client c4 -wait
+
+varnish v1 -expect MAIN.sc_traffic_refuse == 1
+
+# timeout_linger
+
+delay 0.1
+varnish v1 -cliok traffic.accept
+varnish v1 -cliok "param.set timeout_linger 0.001"
+
+barrier b6 cond 2
+barrier b7 sock 2
+
+client c5 {
+	txreq
+	rxresp
+	expect resp.status == 200
+
+	delay 1
+
+	barrier b6 sync
+	barrier b7 sync
+
+	txreq
+	rxresp
+	expect resp.status == 503
+	expect_close
+} -start
+
+barrier b6 sync
+varnish v1 -cliok traffic.refuse
+barrier b7 sync
+
+client c5 -wait
+
+varnish v1 -expect MAIN.sc_traffic_refuse == 2

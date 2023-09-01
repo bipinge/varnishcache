@@ -449,6 +449,46 @@ CLI_CMD(PID,
 	0, 0
 )
 
+CLI_CMD(TRAFFIC_ACCEPT,
+    "traffic.accept",
+    "traffic.accept",
+    "Accept new client connections and requests.",
+    "Accepting client traffic is the normal mode of operations. Listen "
+    "addresses must all be available to succeed, which may not be the "
+    "case after a traffic.refuse command until all ongoing connections "
+    "are closed.",
+    0, 0
+)
+
+CLI_CMD(TRAFFIC_REFUSE,
+    "traffic.refuse",
+    "traffic.refuse",
+    "Refuse new client connections and requests.",
+    "When a Varnish instance is taken offline, for example to be removed "
+    "from a cluster, new traffic can be refused without affecting ongoing "
+    "transactions.\n\n"
+    "Listen sockets are closed and it is no longer possible to establish "
+    "new connections for clients. This means that traffic.accept may fail "
+    "to bind listen addresses again, if meanwhile they end up already in "
+    "use.\n\n"
+    "Refusing new traffic also implies refusing new requests for exsiting "
+    "connections, disabling HTTP/1 keep-alive. Responses initiated after "
+    "client traffic started being refused will have a 'Connection: close' "
+    "header. If a request is received on a keep-alive session while traffic "
+    "is being refused, it results in a minimal 503 response.\n\n"
+    "For h2 traffic, a GOAWAY frame is sent to clients to notify them that "
+    "ongoing streams can complete, but new streams will be refused.",
+    0, 0
+)
+
+CLI_CMD(TRAFFIC_STATUS,
+    "traffic.status",
+    "traffic.status [-j]",
+    "Check the status for new client connections and requests.",
+    "",
+    0, 0
+)
+
 #undef CLI_CMD
 
 /*lint -restore */

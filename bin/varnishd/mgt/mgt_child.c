@@ -33,7 +33,9 @@
 
 #include "config.h"
 
+#include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 
 #include <poll.h>
 #include <stdarg.h>
@@ -331,6 +333,10 @@ mgt_launch_child(struct cli *cli)
 	MCH_Fd_Inherit(heritage.cli_out, "cli_out");
 	child_cli_in = cp[0];
 
+	/* Create socketpair for posting fd's to the child */
+	heritage.fence = mgt_SMUG_Init();
+	MCH_Fd_Inherit(heritage.fence, "smug-fence");
+
 	/*
 	 * Open pipe for child stdout/err
 	 * NB: not inherited, because we dup2() it to stdout/stderr in child
@@ -350,7 +356,6 @@ mgt_launch_child(struct cli *cli)
 		exit(1);		// XXX Harsh ?
 	}
 	if (pid == 0) {
-
 		if (MGT_FEATURE(FEATURE_NO_COREDUMP)) {
 			memset(rl, 0, sizeof *rl);
 			rl->rlim_cur = 0;
@@ -378,6 +383,9 @@ mgt_launch_child(struct cli *cli)
 		 * circumstances.
 		 */
 		closelog();
+
+		/* Closing manually to clear file descriptors */
+		MAC_close_sockets();
 
 		for (i = STDERR_FILENO + 1; i <= CLOSE_FD_UP_TO; i++) {
 			if (vbit_test(fd_map, i))
@@ -431,6 +439,9 @@ mgt_launch_child(struct cli *cli)
 
 	MCH_Fd_Inherit(heritage.cli_out, NULL);
 	closefd(&heritage.cli_out);
+
+	MCH_Fd_Inherit(heritage.fence, NULL);
+	closefd(&heritage.fence);
 
 	child_std_vlu = VLU_New(child_line, NULL, 0);
 	AN(child_std_vlu);
@@ -486,6 +497,15 @@ mgt_launch_child(struct cli *cli)
 		mgt_launch_err(cli, u, "Child (%jd) Pushing vcls failed:\n%s",
 		    (intmax_t)child_pid, p);
 		free(p);
+		MCH_Stop_Child();
+		return;
+	}
+
+	if (mgt_param.accept_traffic && MAC_smuggle_sockets()) {
+		VCLI_SetResult(cli, CLIS_CANT);
+		MGT_Complain(C_ERR,
+		    "Child (%jd) Pushing listen sockets failed\n",
+		    (intmax_t)child_pid);
 		MCH_Stop_Child();
 		return;
 	}
@@ -620,6 +640,9 @@ mgt_reap_child(void)
 	(void)child_listener(NULL, VEV__RD);
 	closefd(&child_output);
 	VLU_Destroy(&child_std_vlu);
+
+	/* Notify smug that the child has been reaped */
+	mgt_SMUG_Fini();
 
 	child_pid = -1;
 

@@ -76,6 +76,16 @@ struct uds_perms {
 static VTAILQ_HEAD(,listen_arg) listen_args =
     VTAILQ_HEAD_INITIALIZER(listen_args);
 
+static void
+mac_closesocket(struct listen_sock *ls)
+{
+
+	CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+	if (ls->sock < 0)
+		return;
+	closefd(&ls->sock);
+}
+
 static int
 mac_vus_bind(void *priv, const struct sockaddr_un *uds)
 {
@@ -89,10 +99,7 @@ mac_opensocket(struct listen_sock *ls)
 	const char *err;
 
 	CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
-	if (ls->sock > 0) {
-		MCH_Fd_Inherit(ls->sock, NULL);
-		closefd(&ls->sock);
-	}
+	assert(ls->sock < 0);
 	if (!ls->uds)
 		ls->sock = VTCP_bind(ls->addr, NULL);
 	else
@@ -112,7 +119,6 @@ mac_opensocket(struct listen_sock *ls)
 		if (chown(ls->endpoint, ls->perms->uid, ls->perms->gid) != 0)
 			return (errno);
 	}
-	MCH_Fd_Inherit(ls->sock, "sock");
 	return (0);
 }
 
@@ -128,6 +134,8 @@ MAC_reopen_sockets(void)
 	int err, fail = 0;
 
 	VTAILQ_FOREACH(ls, &heritage.socks, list) {
+		CHECK_OBJ(ls, LISTEN_SOCK_MAGIC);
+		mac_closesocket(ls);
 		VJ_master(JAIL_MASTER_PRIVPORT);
 		err = mac_opensocket(ls);
 		VJ_master(JAIL_MASTER_LOW);
@@ -139,6 +147,55 @@ MAC_reopen_sockets(void)
 		    ls->endpoint, VAS_errtxt(err));
 	}
 	return (fail);
+}
+
+/*--------------------------------------------------------------------*/
+
+void
+MAC_close_sockets(void)
+{
+	struct listen_sock *ls;
+
+	VTAILQ_FOREACH(ls, &heritage.socks, list) {
+		CHECK_OBJ(ls, LISTEN_SOCK_MAGIC);
+		mac_closesocket(ls);
+	}
+}
+
+/*--------------------------------------------------------------------*/
+
+int
+MAC_smuggle_sockets(void)
+{
+	struct listen_sock *ls;
+
+	VTAILQ_FOREACH(ls, &heritage.socks, list) {
+		CHECK_OBJ(ls, LISTEN_SOCK_MAGIC);
+		assert(ls->sock > 0);
+		AN(ls->nonce);
+		AZ(*ls->nonce);
+		*ls->nonce = mgt_smuggle(ls->sock);
+		if (*ls->nonce == 0)
+			break;
+	}
+
+	if (ls == NULL) {
+		MAC_close_sockets();
+		return (0);
+	}
+
+	MGT_Complain(C_ERR, "Could not smuggle listen socket %d: (%s)",
+	    ls->sock, ls->endpoint);
+
+	VTAILQ_FOREACH(ls, &heritage.socks, list) {
+		if (*ls->nonce != 0) {
+			assert(ls->sock > 0);
+			XXXAZ(mgt_SMUG_Cancel(*ls->nonce));
+			*ls->nonce = 0;
+		}
+	}
+
+	return (-1);
 }
 
 /*--------------------------------------------------------------------*/

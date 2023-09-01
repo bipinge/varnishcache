@@ -35,6 +35,7 @@
 
 #include "config.h"
 
+#include <signal.h>
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -53,8 +54,9 @@
 static pthread_t	VCA_thread;
 static vtim_dur vca_pace = 0.0;
 static struct lock pace_mtx;
+static struct lock shut_mtx;
+static pthread_cond_t shut_cond = PTHREAD_COND_INITIALIZER;
 static unsigned pool_accepting;
-static pthread_mutex_t shut_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 struct wrk_accept {
 	unsigned		magic;
@@ -71,10 +73,16 @@ struct poolsock {
 	unsigned			magic;
 #define POOLSOCK_MAGIC			0x1b0a2d38
 	VTAILQ_ENTRY(poolsock)		list;
+	VTAILQ_ENTRY(poolsock)		busy_list;
+	pthread_t			busy_thr;
+	struct worker			*busy_wrk;
 	struct listen_sock		*lsock;
 	struct pool_task		task[1];
 	struct pool			*pool;
 };
+
+static VTAILQ_HEAD(,poolsock)		busy_socks =
+    VTAILQ_HEAD_INITIALIZER(busy_socks);
 
 /*--------------------------------------------------------------------
  * TCP options we want to control
@@ -324,6 +332,8 @@ vca_pace_check(void)
 {
 	vtim_dur p;
 
+	if (!pool_accepting)
+		vca_pace = 0.0;
 	if (vca_pace == 0.0)
 		return;
 	Lck_Lock(&pace_mtx);
@@ -509,13 +519,41 @@ vca_accept_task(struct worker *wrk, void *arg)
 		vca_pace_check();
 
 		wa.acceptaddrlen = sizeof wa.acceptaddr;
+
+		Lck_Lock(&shut_mtx);
+		AZ(ps->busy_wrk);
+		if (pool_accepting) {
+			ps->busy_wrk = wrk;
+			ps->busy_thr = pthread_self();
+			VTAILQ_INSERT_TAIL(&busy_socks, ps, busy_list);
+		}
+		Lck_Unlock(&shut_mtx);
+
+		if (ps->busy_wrk == NULL) {
+			AZ(Pool_Task(wrk->pool, ps->task, TASK_QUEUE_VCA));
+			return;
+		}
+
 		do {
 			i = accept(ls->sock, (void*)&wa.acceptaddr,
 			    &wa.acceptaddrlen);
-		} while (i < 0 && errno == EAGAIN && !ps->pool->die);
+		} while (i < 0 && errno == EAGAIN && !ps->pool->die &&
+		    pool_accepting);
+
+		Lck_Lock(&shut_mtx);
+		ps->busy_wrk = NULL;
+		VTAILQ_REMOVE(&busy_socks, ps, busy_list);
+		if (!pool_accepting && VTAILQ_EMPTY(&busy_socks))
+			AZ(pthread_cond_signal(&shut_cond));
+		Lck_Unlock(&shut_mtx);
 
 		if (i < 0 && ps->pool->die)
 			break;
+
+		if (i < 0 && !pool_accepting) {
+			AZ(Pool_Task(wrk->pool, ps->task, TASK_QUEUE_VCA));
+			return;
+		}
 
 		if (i < 0 && ls->sock == -2) {
 			/* Shut down in progress */
@@ -644,12 +682,10 @@ vca_acct(void *arg)
 	t0 = VTIM_real();
 	vca_periodic(t0);
 
-	pool_accepting = 1;
-
 	while (1) {
 		(void)sleep(1);
-		if (vca_sock_opt_init()) {
-			PTOK(pthread_mutex_lock(&shut_mtx));
+		if (pool_accepting && vca_sock_opt_init()) {
+			Lck_Lock(&shut_mtx);
 			VTAILQ_FOREACH(ls, &heritage.socks, list) {
 				if (ls->sock == -2)
 					continue;	// VCA_Shutdown
@@ -667,7 +703,7 @@ vca_acct(void *arg)
 				 * listening socket. */
 				ls->test_heritage = 1;
 			}
-			PTOK(pthread_mutex_unlock(&shut_mtx));
+			Lck_Unlock(&shut_mtx);
 		}
 		vca_periodic(t0);
 	}
@@ -676,14 +712,37 @@ vca_acct(void *arg)
 
 /*--------------------------------------------------------------------*/
 
-static void v_matchproto_(cli_func_t)
-ccf_start(struct cli *cli, const char * const *av, void *priv)
+static int
+vca_fence(struct cli *cli)
 {
 	struct listen_sock *ls;
 
-	(void)cli;
-	(void)av;
-	(void)priv;
+	VTAILQ_FOREACH(ls, &heritage.socks, list) {
+		assert(ls->sock < 0);
+		AN(ls->nonce);
+		AN(*ls->nonce);
+		ls->sock = SMUG_Fence(*ls->nonce);
+		if (ls->sock < 0)
+			break;
+		*ls->nonce = 0;
+	}
+
+	if (ls == NULL)
+		return (0);
+
+	VCLI_SetResult(cli, CLIS_CANT);
+	VCLI_Out(cli, "Could not acquire listen socket '%s': %s\n",
+	    ls->endpoint, strerror(errno));
+	return (-1);
+}
+
+static void
+vca_start(struct cli *cli)
+{
+	struct listen_sock *ls;
+
+	if (vca_fence(cli) < 0)
+		return;
 
 	(void)vca_sock_opt_init();
 
@@ -697,7 +756,7 @@ ccf_start(struct cli *cli, const char * const *av, void *priv)
 			    ls->sock, errno, VAS_errtxt(errno));
 		if (listen(ls->sock, cache_param->listen_depth)) {
 			VCLI_SetResult(cli, CLIS_CANT);
-			VCLI_Out(cli, "Listen failed on socket '%s': %s",
+			VCLI_Out(cli, "Listen failed on socket '%s': %s\n",
 			    ls->endpoint, VAS_errtxt(errno));
 			return;
 		}
@@ -712,7 +771,20 @@ ccf_start(struct cli *cli, const char * const *av, void *priv)
 			    "Kernel filtering: sock=%d, errno=%d %s",
 			    ls->sock, errno, VAS_errtxt(errno));
 	}
+	pool_accepting = 1;
+}
 
+static void v_matchproto_(cli_func_t)
+ccf_start(struct cli *cli, const char * const *av, void *priv)
+{
+
+	(void)av;
+	(void)priv;
+
+	if (cache_param->accept_traffic)
+		vca_start(cli);
+	/* XXX: why not a bgthread? */
+	AZ(pthread_create(&VCA_thread, NULL, vca_acct, NULL));
 	PTOK(pthread_create(&VCA_thread, NULL, vca_acct, NULL));
 }
 
@@ -728,6 +800,12 @@ ccf_listen_address(struct cli *cli, const char * const *av, void *priv)
 	(void)av;
 	(void)priv;
 
+	if (!cache_param->accept_traffic) {
+		VCLI_SetResult(cli, CLIS_CANT);
+		VCLI_Out(cli, "Not accepting traffic\n");
+		return;
+	}
+
 	/*
 	 * This CLI command is primarily used by varnishtest.  Don't
 	 * respond until listen(2) has been called, in order to avoid
@@ -737,7 +815,7 @@ ccf_listen_address(struct cli *cli, const char * const *av, void *priv)
 	while (!pool_accepting)
 		VTIM_sleep(.1);
 
-	PTOK(pthread_mutex_lock(&shut_mtx));
+	Lck_Lock(&shut_mtx);
 	VTAILQ_FOREACH(ls, &heritage.socks, list) {
 		if (!ls->uds) {
 			VTCP_myname(ls->sock, h, sizeof h, p, sizeof p);
@@ -746,7 +824,32 @@ ccf_listen_address(struct cli *cli, const char * const *av, void *priv)
 		else
 			VCLI_Out(cli, "%s %s -\n", ls->name, ls->endpoint);
 	}
-	PTOK(pthread_mutex_unlock(&shut_mtx));
+	Lck_Unlock(&shut_mtx);
+}
+
+/*--------------------------------------------------------------------*/
+
+static void v_matchproto_(cli_func_t)
+ccf_traffic_accept(struct cli *cli, const char * const *av, void *priv)
+{
+
+	(void)av;
+	(void)priv;
+
+	vca_start(cli);
+	if (cli->result != CLIS_OK)
+		VCA_Shutdown();
+}
+
+static void v_matchproto_(cli_func_t)
+ccf_traffic_refuse(struct cli *cli, const char * const *av, void *priv)
+{
+
+	(void)cli;
+	(void)av;
+	(void)priv;
+
+	VCA_Shutdown();
 }
 
 /*--------------------------------------------------------------------*/
@@ -754,6 +857,8 @@ ccf_listen_address(struct cli *cli, const char * const *av, void *priv)
 static struct cli_proto vca_cmds[] = {
 	{ CLICMD_SERVER_START,		"", ccf_start },
 	{ CLICMD_DEBUG_LISTEN_ADDRESS,	"d", ccf_listen_address },
+	{ CLICMD_TRAFFIC_ACCEPT, "", ccf_traffic_accept },
+	{ CLICMD_TRAFFIC_REFUSE, "", ccf_traffic_refuse },
 	{ NULL }
 };
 
@@ -763,21 +868,37 @@ VCA_Init(void)
 
 	CLI_AddFuncs(vca_cmds);
 	Lck_New(&pace_mtx, lck_vcapace);
+	Lck_New(&shut_mtx, lck_vcashut);
 }
 
 void
 VCA_Shutdown(void)
 {
 	struct listen_sock *ls;
-	int i;
+	struct poolsock *ps;
 
-	PTOK(pthread_mutex_lock(&shut_mtx));
-	VTAILQ_FOREACH(ls, &heritage.socks, list) {
-		i = ls->sock;
-		ls->sock = -2;
-		(void)close(i);
+	ASSERT_CLI();
+
+	pool_accepting = 0;
+	Lck_Lock(&shut_mtx);
+	while (!VTAILQ_EMPTY(&busy_socks)) {
+		VTAILQ_FOREACH(ps, &busy_socks, busy_list) {
+			CHECK_OBJ_NOTNULL(ps, POOLSOCK_MAGIC);
+			CHECK_OBJ_NOTNULL(ps->busy_wrk, WORKER_MAGIC);
+			AZ(pthread_kill(ps->busy_thr, SIGUSR1));
+		}
+		Lck_CondWaitTimeout(&shut_cond, &shut_mtx, 0.1);
 	}
-	PTOK(pthread_mutex_unlock(&shut_mtx));
+
+	VTAILQ_FOREACH(ls, &heritage.socks, list) {
+		if (ls->sock > 0) {
+			closefd(&ls->sock);
+			ls->sock = -2;
+		}
+		free(ls->conn_heritage);
+		ls->conn_heritage = NULL;
+	}
+	Lck_Unlock(&shut_mtx);
 }
 
 /*--------------------------------------------------------------------
