@@ -210,7 +210,10 @@ sub vcl_backend_response {
 }
 
 sub vcl_backend_refresh {
-	return (merge);
+	if (beresp.status == 304) {
+		return (merge);
+	}
+	return (beresp);
 }
 
 sub vcl_builtin_backend_response {

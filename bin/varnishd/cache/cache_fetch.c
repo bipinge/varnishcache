@@ -365,7 +365,6 @@ vbf_304_logic(struct busyobj *bo)
 	http_Unset(bo->beresp, H_Content_Length);
 	HTTP_Merge(bo->wrk, bo->stale_oc, bo->beresp);
 	assert(http_IsStatus(bo->beresp, 200));
-	bo->was_304 = 1;
 }
 
 /*--------------------------------------------------------------------
@@ -388,7 +387,7 @@ vbf_expected_304(struct busyobj *bo)
 static const struct fetch_step * v_matchproto_(vbf_state_f)
 vbf_stp_startfetch(struct worker *wrk, struct busyobj *bo)
 {
-	int i;
+	int i, skip_vbr = 0;
 	vtim_real now;
 	unsigned handling;
 	struct objcore *oc;
@@ -483,19 +482,47 @@ vbf_stp_startfetch(struct worker *wrk, struct busyobj *bo)
 	AZ(bo->do_esi);
 	AZ(bo->was_304);
 
-	if (http_IsStatus(bo->beresp, 304)) {
-		if (!vbf_expected_304(bo))
+	if (bo->stale_oc != NULL) {
+		if (http_IsStatus(bo->beresp, 304) &&
+		    !vbf_expected_304(bo)) {
+			VSLb(bo->vsl, SLT_Error,
+			    "304 response but not conditional fetch");
+			bo->htc->doclose = SC_RX_BAD;
+			vbf_cleanup(bo);
 			return (F_STP_ERROR);
-		else if (bo->stale_oc != NULL &&
-		    ObjCheckFlag(bo->wrk, bo->stale_oc, OF_IMSCAND))
-			vbf_304_logic(bo);
+		}
+		if (http_IsStatus(bo->beresp, 304) &&
+		    vbf_expected_304(bo))
+			bo->was_304 = 1;
+		VCL_backend_refresh_method(bo->vcl, wrk, NULL, bo, NULL);
+		switch (wrk->vpi->handling) {
+				case VCL_RET_MERGE:
+					vbf_304_logic(bo);
+					break;
+				case VCL_RET_BERESP:
+					break;
+				case VCL_RET_OBJ_STALE:
+					HTTP_Decode(bo->beresp, ObjGetAttr(bo->wrk, bo->stale_oc, OA_HEADERS, NULL));
+					break;
+				case VCL_RET_ERROR:
+					/* FALLTHROUGH */
+				case VCL_RET_ABANDON:
+					/* FALLTHROUGH */
+				case VCL_RET_FAIL:
+					/* FALLTHROUGH */
+				case VCL_RET_RETRY:
+					skip_vbr = 1;
+					break;
+				default:
+					WRONG("Illegal return from vcl_backend_refresh{}");
+		}
 	}
 
 	if (bo->htc != NULL && bo->htc->doclose == SC_NULL &&
 	    http_GetHdrField(bo->bereq, H_Connection, "close", NULL))
 		bo->htc->doclose = SC_REQ_CLOSE;
-
-	VCL_backend_response_method(bo->vcl, wrk, NULL, bo, NULL);
+	if (!skip_vbr)
+		VCL_backend_response_method(bo->vcl, wrk, NULL, bo, NULL);
 
 	if (bo->htc != NULL && bo->htc->doclose == SC_NULL &&
 	    http_GetHdrField(bo->beresp, H_Connection, "close", NULL))
