@@ -348,36 +348,36 @@ vbf_stp_retry(struct worker *wrk, struct busyobj *bo)
  * 304 setup logic
  */
 
-static int
+static void
 vbf_304_logic(struct busyobj *bo)
 {
-	if (bo->stale_oc != NULL &&
-	    ObjCheckFlag(bo->wrk, bo->stale_oc, OF_IMSCAND)) {
-		AZ(bo->stale_oc->flags & (OC_F_HFM|OC_F_PRIVATE));
-		if (ObjCheckFlag(bo->wrk, bo->stale_oc, OF_CHGCE)) {
-			/*
-			 * If a VFP changed C-E in the stored
-			 * object, then don't overwrite C-E from
-			 * the IMS fetch, and we must weaken any
-			 * new ETag we get.
-			 */
-			RFC2616_Weaken_Etag(bo->beresp);
-		}
-		http_Unset(bo->beresp, H_Content_Encoding);
-		http_Unset(bo->beresp, H_Content_Length);
-		HTTP_Merge(bo->wrk, bo->stale_oc, bo->beresp);
-		assert(http_IsStatus(bo->beresp, 200));
-		bo->was_304 = 1;
-	} else if (!bo->uncacheable) {
+	AZ(bo->stale_oc->flags & (OC_F_HFM|OC_F_PRIVATE));
+	if (ObjCheckFlag(bo->wrk, bo->stale_oc, OF_CHGCE)) {
 		/*
-		 * Backend sent unallowed 304
+		 * If a VFP changed C-E in the stored
+		 * object, then don't overwrite C-E from
+		 * the IMS fetch, and we must weaken any
+		 * new ETag we get.
 		 */
-		VSLb(bo->vsl, SLT_Error,
-		    "304 response but not conditional fetch");
-		bo->htc->doclose = SC_RX_BAD;
-		vbf_cleanup(bo);
-		return (-1);
+		RFC2616_Weaken_Etag(bo->beresp);
 	}
+	http_Unset(bo->beresp, H_Content_Encoding);
+	http_Unset(bo->beresp, H_Content_Length);
+	HTTP_Merge(bo->wrk, bo->stale_oc, bo->beresp);
+	assert(http_IsStatus(bo->beresp, 200));
+	bo->was_304 = 1;
+}
+
+/*--------------------------------------------------------------------
+* Expected 304 ?
+*/
+
+static int
+vbf_expected_304(struct busyobj *bo)
+{
+	if (!(bo->stale_oc != NULL &&
+	    ObjCheckFlag(bo->wrk, bo->stale_oc, OF_IMSCAND)) && !bo->uncacheable)
+		return (0);
 	return (1);
 }
 
@@ -483,8 +483,13 @@ vbf_stp_startfetch(struct worker *wrk, struct busyobj *bo)
 	AZ(bo->do_esi);
 	AZ(bo->was_304);
 
-	if (http_IsStatus(bo->beresp, 304) && vbf_304_logic(bo) < 0)
-		return (F_STP_ERROR);
+	if (http_IsStatus(bo->beresp, 304)) {
+		if (!vbf_expected_304(bo))
+			return (F_STP_ERROR);
+		else if (bo->stale_oc != NULL &&
+		    ObjCheckFlag(bo->wrk, bo->stale_oc, OF_IMSCAND))
+			vbf_304_logic(bo);
+	}
 
 	if (bo->htc != NULL && bo->htc->doclose == SC_NULL &&
 	    http_GetHdrField(bo->bereq, H_Connection, "close", NULL))
