@@ -1353,6 +1353,7 @@ beresp.was_304
 
 	Readable from: vcl_backend_response, vcl_backend_error, vcl_backend_refresh
 
+	Writable from: vcl_backend_refresh
 
 	When ``true`` this indicates that we got a 304 response
 	to our conditional fetch from the backend and turned

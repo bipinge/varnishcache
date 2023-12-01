@@ -39,7 +39,7 @@ BERESP_FLAG(do_esi,		1, 1, 1, "")
 BERESP_FLAG(do_gzip,	1, 1, 1, "")
 BERESP_FLAG(do_gunzip,	1, 1, 1, "")
 BERESP_FLAG(do_stream,	1, 1, 0, "")
-BERESP_FLAG(was_304,	1, 0, 0, "")
+BERESP_FLAG(was_304,	1, 1, 0, "")
 #undef BERESP_FLAG
 
 /*lint -restore */
