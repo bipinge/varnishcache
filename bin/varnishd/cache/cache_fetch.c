@@ -368,19 +368,6 @@ vbf_304_logic(struct busyobj *bo)
 }
 
 /*--------------------------------------------------------------------
-* Expected 304 ?
-*/
-
-static int
-vbf_expected_304(struct busyobj *bo)
-{
-	if (!(bo->stale_oc != NULL &&
-	    ObjCheckFlag(bo->wrk, bo->stale_oc, OF_IMSCAND)) && !bo->uncacheable)
-		return (0);
-	return (1);
-}
-
-/*--------------------------------------------------------------------
  * Setup bereq from bereq0, run vcl_backend_fetch
  */
 
@@ -483,17 +470,6 @@ vbf_stp_startfetch(struct worker *wrk, struct busyobj *bo)
 	AZ(bo->was_304);
 
 	if (bo->stale_oc != NULL) {
-		if (http_IsStatus(bo->beresp, 304) &&
-		    !vbf_expected_304(bo)) {
-			VSLb(bo->vsl, SLT_Error,
-			    "304 response but not conditional fetch");
-			bo->htc->doclose = SC_RX_BAD;
-			vbf_cleanup(bo);
-			return (F_STP_ERROR);
-		}
-		if (http_IsStatus(bo->beresp, 304) &&
-		    vbf_expected_304(bo))
-			bo->was_304 = 1;
 		VCL_backend_refresh_method(bo->vcl, wrk, NULL, bo, NULL);
 		switch (wrk->vpi->handling) {
 				case VCL_RET_MERGE:
@@ -516,6 +492,15 @@ vbf_stp_startfetch(struct worker *wrk, struct busyobj *bo)
 				default:
 					WRONG("Illegal return from vcl_backend_refresh{}");
 		}
+	} else if (http_IsStatus(bo->beresp, 304) && !bo->uncacheable) {
+		/*
+		 * Backend sent unallowed 304
+		 */
+		VSLb(bo->vsl, SLT_Error,
+		    "304 response but not conditional fetch");
+		bo->htc->doclose = SC_RX_BAD;
+		vbf_cleanup(bo);
+		return (F_STP_ERROR);
 	}
 
 	if (bo->htc != NULL && bo->htc->doclose == SC_NULL &&

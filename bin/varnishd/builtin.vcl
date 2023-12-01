@@ -209,9 +209,33 @@ sub vcl_backend_response {
 	return (deliver);
 }
 
-sub vcl_backend_refresh {
+sub vcl_refresh_expected_304 {
+	if (obj_stale.status == 200 &&
+	    (obj_stale.http.Last-Modified || obj_stale.http.ETag)) {
+		set beresp.was_304 = true;
+	} else if (!beresp.uncacheable) {
+		return (error);
+	}
+}
+
+sub vcl_refresh_200 {
 	if (beresp.status == 304) {
 		return (merge);
+	}
+}
+
+sub vcl_refresh_others {
+	return (beresp);
+}
+
+sub vcl_backend_refresh {
+	if (beresp.status == 304) {
+		call vcl_refresh_expected_304;
+	}
+	if (obj_stale.status == 200) {
+		call vcl_refresh_200;
+	} else {
+		call vcl_refresh_others;
 	}
 	return (beresp);
 }

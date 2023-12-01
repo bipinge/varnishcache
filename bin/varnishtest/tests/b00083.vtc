@@ -18,7 +18,7 @@ varnish v1 -vcl+backend {
 		set beresp.http.was-304 = beresp.was_304;
 	}
 
-	sub vcl_backend_refresh {
+	sub vcl_refresh_200 {
 		set beresp.http.vbref = "true";
 
 		set beresp.http.http = obj_stale.http.from-bo;
