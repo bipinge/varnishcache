@@ -66,7 +66,8 @@
 #include "vapi/vsig.h"
 #include "vapi/vsm.h"
 #include "vas.h"
-#include "vcli.h"
+#include "vcli_serve.h"
+#include "vsb.h"
 #include "vjsn.h"
 #include "vtcp.h"
 
@@ -83,7 +84,13 @@ enum pass_mode_e {
 
 static double timeout = 5;
 static int p_arg = 0;
+static int e_arg = 0;
 static int line_sock;
+
+static void v_noreturn_
+adm_exit(enum VCLI_status_e status) {
+	RL_EXIT(status / 100);
+}
 
 static void
 cli_write(int sock, const char *s)
@@ -95,7 +102,7 @@ cli_write(int sock, const char *s)
 	if (i == l)
 		return;
 	perror("Write error CLI socket");
-	RL_EXIT(1);
+	adm_exit(CLIS_COMMS);
 }
 
 /*
@@ -166,23 +173,9 @@ cli_sock(const char *T_arg, const char *S_arg)
 	return (sock);
 }
 
-static unsigned
-pass_answer(int fd, enum pass_mode_e mode)
+static void
+pass_print_answer(int status, char *answer, enum pass_mode_e mode)
 {
-	unsigned u, status;
-	char *answer = NULL;
-
-	u = VCLI_ReadResult(fd, &status, &answer, timeout);
-	if (u) {
-		if (status == CLIS_COMMS) {
-			fprintf(stderr, "%s\n", answer);
-			RL_EXIT(2);
-		}
-		if (answer)
-			fprintf(stderr, "%s\n", answer);
-		RL_EXIT(1);
-	}
-
 	if (p_arg && answer != NULL) {
 		printf("%-3u %-8zu\n%s", status, strlen(answer), answer);
 	} else if (p_arg) {
@@ -195,8 +188,28 @@ pass_answer(int fd, enum pass_mode_e mode)
 		if (status == CLIS_TRUNCATED)
 			printf("[response was truncated]\n");
 	}
+	fflush(stdout);
+}
+
+static unsigned
+pass_answer(int fd, enum pass_mode_e mode)
+{
+	unsigned u, status;
+	char *answer = NULL;
+
+	u = VCLI_ReadResult(fd, &status, &answer, timeout);
+	if (u) {
+		if (status == CLIS_COMMS) {
+			fprintf(stderr, "%s\n", answer);
+			adm_exit(CLIS_COMMS);
+		}
+		if (answer)
+			fprintf(stderr, "%s\n", answer);
+		adm_exit(status);
+	}
+
+	pass_print_answer(status, answer, mode);
 	free(answer);
-	(void)fflush(stdout);
 	return (status);
 }
 
@@ -219,7 +232,7 @@ do_args(int sock, int argc, char * const *argv)
 		exit(0);
 	if (!p_arg)
 		fprintf(stderr, "Command failed with error code %u\n", status);
-	exit(1);
+	adm_exit(status);
 }
 
 /* Callback for readline, doesn't take a private pointer, so we need
@@ -338,57 +351,54 @@ interactive(int sock)
 	}
 }
 
+/*--------------------------------------------------------------------*/
+
+static void
+vadm_cli_cb_after(const struct cli *cli)
+{
+	const char *cmd;
+
+	if (!e_arg)
+		return;
+
+	if (cli->result == CLIS_OK || cli->result == CLIS_TRUNCATED)
+		return;
+
+	cmd = VSB_data(cli->cmd);
+	if (*cmd == '-')
+		return;
+
+	pass_print_answer(cli->result, VSB_data(cli->sb), pass_script);
+	fprintf(stderr, "\nCommand \"%s\" failed with error code %u\n",
+	    cmd, cli->result);
+	adm_exit(cli->result);
+}
+
 /*
  * No arguments given, simply pass bytes on stdin/stdout and CLI socket
  */
+
 static void v_noreturn_
 pass(int sock)
 {
-	struct pollfd fds[2];
-	char buf[1024];
+	struct VCLP *vclp;
 	int i;
-	ssize_t n;
-	int busy = 0;
 
-	fds[0].fd = sock;
-	fds[0].events = POLLIN;
-	fds[1].fd = 0;
-	fds[1].events = POLLIN;
-	while (1) {
-		i = poll(fds, 2, -1);
-		if (i == -1 && errno == EINTR) {
-			continue;
-		}
-		assert(i > 0);
-		if (fds[0].revents & POLLIN) {
-			(void)pass_answer(fds[0].fd, pass_script);
-			busy = 0;
-			if (fds[1].fd < 0)
-				RL_EXIT(0);
-		}
-		if (fds[1].revents & POLLIN || fds[1].revents & POLLHUP) {
-			n = read(fds[1].fd, buf, sizeof buf - 1);
-			if (n == 0) {
-				if (!busy)
-					RL_EXIT(0);
-				fds[1].fd = -1;
-			} else if (n < 0) {
-				RL_EXIT(0);
-			} else {
-				busy = 1;
-				buf[n] = '\0';
-				cli_write(sock, buf);
-			}
-		}
-	}
+	vclp = VCLP_New(STDIN_FILENO, STDOUT_FILENO,
+	    sock, p_arg ? PROTO_FULL : PROTO_HEADLESS, timeout);
+	AN(vclp);
+	VCLP_SetHooks(vclp, NULL, vadm_cli_cb_after);
+	do {
+		i = VCLP_Poll(vclp, -1);
+	} while (i == 0);
+	RL_EXIT(0);
 }
-
 
 static void v_noreturn_
 usage(int status)
 {
 	fprintf(stderr,
-	    "Usage: varnishadm [-h] [-n ident] [-p] [-S secretfile] "
+	    "Usage: varnishadm [-e] [-h] [-n ident] [-p] [-S secretfile] "
 	    "[-T [address]:port] [-t timeout] [command [...]]\n");
 	fprintf(stderr, "\t-n is mutually exclusive with -S and -T\n");
 	exit(status);
@@ -452,7 +462,7 @@ t_arg_timeout(const char *t_arg)
 	return (1);
 }
 
-#define OPTARG "hn:pS:T:t:"
+#define OPTARG "ehn:pS:T:t:"
 
 int
 main(int argc, char * const *argv)
@@ -477,6 +487,9 @@ main(int argc, char * const *argv)
 	 */
 	while ((opt = getopt(argc, argv, "+" OPTARG)) != -1) {
 		switch (opt) {
+		case 'e':
+			e_arg = 1;
+			break;
 		case 'h':
 			/* Usage help */
 			usage(0);
@@ -496,7 +509,7 @@ main(int argc, char * const *argv)
 			t_arg = optarg;
 			break;
 		default:
-			usage(1);
+			usage(2);
 		}
 	}
 
@@ -505,11 +518,11 @@ main(int argc, char * const *argv)
 
 	if (T_arg != NULL) {
 		if (n_arg != NULL)
-			usage(1);
+			usage(2);
 		sock = cli_sock(T_arg, S_arg);
 	} else {
 		if (S_arg != NULL)
-			usage(1);
+			usage(2);
 		sock = n_arg_sock(n_arg, t_arg);
 	}
 	if (sock < 0)
