@@ -28,9 +28,6 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * This source file has the various trickery surrounding the accept/listen
- * sockets.
- *
  */
 
 #include "config.h"
@@ -39,10 +36,14 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-#include "cache_varnishd.h"
+#include "cache/cache_varnishd.h"
 
-#include "cache_transport.h"
-#include "cache_pool.h"
+#include "acceptor/cache_acceptor.h"
+#include "acceptor/acceptor_priv.h"
+#include "acceptor/acceptor_tcp.h"
+
+#include "cache/cache_transport.h"
+#include "cache/cache_pool.h"
 #include "common/heritage.h"
 
 #include "vcli_serve.h"
@@ -50,31 +51,9 @@
 #include "vtcp.h"
 #include "vtim.h"
 
-static pthread_t	VCA_thread;
-static vtim_dur vca_pace = 0.0;
-static struct lock pace_mtx;
-static unsigned pool_accepting;
-static pthread_mutex_t shut_mtx = PTHREAD_MUTEX_INITIALIZER;
-
-struct wrk_accept {
-	unsigned		magic;
-#define WRK_ACCEPT_MAGIC	0x8c4b4d59
-
-	/* Accept stuff */
-	struct sockaddr_storage	acceptaddr;
-	socklen_t		acceptaddrlen;
-	int			acceptsock;
-	struct listen_sock	*acceptlsock;
-};
-
-struct poolsock {
-	unsigned			magic;
-#define POOLSOCK_MAGIC			0x1b0a2d38
-	VTAILQ_ENTRY(poolsock)		list;
-	struct listen_sock		*lsock;
-	struct pool_task		task[1];
-	struct pool			*pool;
-};
+extern vtim_dur acc_pace;
+extern struct lock pace_mtx;
+extern unsigned pool_accepting;
 
 /*--------------------------------------------------------------------
  * TCP options we want to control
@@ -118,11 +97,6 @@ static struct sock_opt {
 
 static const int n_sock_opts = sizeof sock_opts / sizeof sock_opts[0];
 
-struct conn_heritage {
-	unsigned	sess_set;
-	unsigned	listen_mod;
-};
-
 /*--------------------------------------------------------------------
  * We want to get out of any kind of trouble-hit TCP connections as fast
  * as absolutely possible, so we set them LINGER disabled, so that even if
@@ -137,28 +111,11 @@ static const struct linger disable_so_linger = {
  * We turn on keepalives by default to assist in detecting clients that have
  * hung up on connections returning from waitinglists
  */
-
 static const unsigned enable_so_keepalive = 1;
 
 /* We disable Nagle's algorithm in favor of low latency setups.
  */
-
 static const unsigned enable_tcp_nodelay = 1;
-
-/*--------------------------------------------------------------------
- * lacking a better place, we put some generic periodic updates
- * into the vca_acct() loop which we are running anyway
- */
-static void
-vca_periodic(vtim_real t0)
-{
-	vtim_real now;
-
-	now = VTIM_real();
-	VSC_C_main->uptime = (uint64_t)(now - t0);
-
-	VTIM_postel = FEATURE(FEATURE_HTTP_DATE_POSTEL);
-}
 
 /*--------------------------------------------------------------------
  * Some kernels have bugs/limitations with respect to which options are
@@ -167,7 +124,7 @@ vca_periodic(vtim_real t0)
  */
 
 static int
-vca_sock_opt_init(void)
+acc_tcp_sockopt_init(void)
 {
 	struct sock_opt *so;
 	union sock_arg tmp;
@@ -220,11 +177,12 @@ vca_sock_opt_init(void)
 		    (int)cache_param->tcp_keepalive_time);
 #endif
 	}
+
 	return (chg);
 }
 
 static void
-vca_sock_opt_test(const struct listen_sock *ls, const struct sess *sp)
+acc_tcp_sockopt_test(const struct listen_sock *ls, const struct sess *sp)
 {
 	struct conn_heritage *ch;
 	struct sock_opt *so;
@@ -238,34 +196,32 @@ vca_sock_opt_test(const struct listen_sock *ls, const struct sess *sp)
 	for (n = 0; n < n_sock_opts; n++) {
 		so = &sock_opts[n];
 		ch = &ls->conn_heritage[n];
+
 		if (ch->sess_set) {
 			VSL(SLT_Debug, sp->vxid,
 			    "sockopt: Not testing nonhereditary %s for %s=%s",
 			    so->strname, ls->name, ls->endpoint);
 			continue;
 		}
-		if (so->level == IPPROTO_TCP && ls->uds) {
-			VSL(SLT_Debug, sp->vxid,
-			    "sockopt: Not testing incompatible %s for %s=%s",
-			    so->strname, ls->name, ls->endpoint);
-			continue;
-		}
+
 		memset(&tmp, 0, sizeof tmp);
 		l = so->sz;
 		i = getsockopt(sp->fd, so->level, so->optname, &tmp, &l);
+
 		if (i == 0 && memcmp(&tmp, so->arg, so->sz)) {
 			VSL(SLT_Debug, sp->vxid,
 			    "sockopt: Test confirmed %s non heredity for %s=%s",
 			    so->strname, ls->name, ls->endpoint);
 			ch->sess_set = 1;
 		}
+
 		if (i && errno != ENOPROTOOPT)
 			VTCP_Assert(i);
 	}
 }
 
 static void
-vca_sock_opt_set(const struct listen_sock *ls, const struct sess *sp)
+acc_tcp_sockopt_set(const struct listen_sock *ls, const struct sess *sp)
 {
 	struct conn_heritage *ch;
 	struct sock_opt *so;
@@ -286,75 +242,104 @@ vca_sock_opt_set(const struct listen_sock *ls, const struct sess *sp)
 	for (n = 0; n < n_sock_opts; n++) {
 		so = &sock_opts[n];
 		ch = &ls->conn_heritage[n];
-		if (so->level == IPPROTO_TCP && ls->uds) {
-			VSL(SLT_Debug, vxid,
-			    "sockopt: Not setting incompatible %s for %s=%s",
-			    so->strname, ls->name, ls->endpoint);
-			continue;
-		}
+
 		if (sp == NULL && ch->listen_mod == so->mod) {
 			VSL(SLT_Debug, vxid,
 			    "sockopt: Not setting unmodified %s for %s=%s",
 			    so->strname, ls->name, ls->endpoint);
 			continue;
 		}
+
 		if  (sp != NULL && !ch->sess_set) {
 			VSL(SLT_Debug, sp->vxid,
 			    "sockopt: %s may be inherited for %s=%s",
 			    so->strname, ls->name, ls->endpoint);
 			continue;
 		}
+
 		VSL(SLT_Debug, vxid,
 		    "sockopt: Setting %s for %s=%s",
 		    so->strname, ls->name, ls->endpoint);
 		VTCP_Assert(setsockopt(sock,
 		    so->level, so->optname, so->arg, so->sz));
+
 		if (sp == NULL)
 			ch->listen_mod = so->mod;
 	}
 }
 
-/*--------------------------------------------------------------------
- * If accept(2)'ing fails, we pace ourselves to relive any resource
- * shortage if possible.
- */
-
 static void
-vca_pace_check(void)
+acc_tcp_init(void)
 {
-	vtim_dur p;
 
-	if (vca_pace == 0.0)
-		return;
-	Lck_Lock(&pace_mtx);
-	p = vca_pace;
-	Lck_Unlock(&pace_mtx);
-	if (p > 0.0)
-		VTIM_sleep(p);
+}
+
+static int
+acc_tcp_listen(struct cli *cli, struct listen_sock *ls)
+{
+
+	CHECK_OBJ_NOTNULL(ls->transport, TRANSPORT_MAGIC);
+	assert (ls->sock > 0);	// We know where stdin is
+
+	if (cache_param->tcp_fastopen &&
+	    VTCP_fastopen(ls->sock, cache_param->listen_depth))
+		VSL(SLT_Error, NO_VXID,
+		    "Kernel TCP Fast Open: sock=%d, errno=%d %s",
+		    ls->sock, errno, VAS_errtxt(errno));
+
+	if (listen(ls->sock, cache_param->listen_depth)) {
+		VCLI_SetResult(cli, CLIS_CANT);
+		VCLI_Out(cli, "Listen failed on socket '%s': %s",
+		    ls->endpoint, VAS_errtxt(errno));
+		return (-1);
+	}
+
+	AZ(ls->conn_heritage);
+	ls->conn_heritage = calloc(n_sock_opts,
+	    sizeof *ls->conn_heritage);
+	AN(ls->conn_heritage);
+
+	ls->test_heritage = 1;
+	acc_tcp_sockopt_set(ls, NULL);
+
+	if (cache_param->accept_filter && VTCP_filter_http(ls->sock))
+		VSL(SLT_Error, NO_VXID,
+		    "Kernel filtering: sock=%d, errno=%d %s",
+		    ls->sock, errno, VAS_errtxt(errno));
+
+	return (0);
 }
 
 static void
-vca_pace_bad(void)
+acc_tcp_start(struct cli *cli)
 {
+	struct listen_sock *ls;
 
-	Lck_Lock(&pace_mtx);
-	vca_pace += cache_param->acceptor_sleep_incr;
-	if (vca_pace > cache_param->acceptor_sleep_max)
-		vca_pace = cache_param->acceptor_sleep_max;
-	Lck_Unlock(&pace_mtx);
+	ASSERT_CLI();
+
+	(void)acc_tcp_sockopt_init();
+
+	VTAILQ_FOREACH(ls, &TCP_acceptor.socks, acclist) {
+		CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+
+		if (acc_tcp_listen(cli, ls))
+			return;
+	}
 }
 
 static void
-vca_pace_good(void)
+acc_tcp_event(struct cli *cli, struct listen_sock *ls, enum acc_event event)
 {
+	char h[VTCP_ADDRBUFSIZE], p[VTCP_PORTBUFSIZE];
 
-	if (vca_pace == 0.0)
-		return;
-	Lck_Lock(&pace_mtx);
-	vca_pace *= cache_param->acceptor_sleep_decay;
-	if (vca_pace < cache_param->acceptor_sleep_incr)
-		vca_pace = 0.0;
-	Lck_Unlock(&pace_mtx);
+	switch (event) {
+	case ACC_EVENT_LADDR:
+		VTCP_myname(ls->sock, h, sizeof h, p, sizeof p);
+		VCLI_Out(cli, "%s %s %s\n", ls->name, h, p);
+		break;
+	default:
+		WRONG("INVALID ACC_EVENT");
+	}
 }
 
 /*--------------------------------------------------------------------
@@ -364,7 +349,7 @@ vca_pace_good(void)
  */
 
 static void
-vca_mk_tcp(const struct wrk_accept *wa,
+acc_mk_tcp(const struct wrk_accept *wa,
     struct sess *sp, char *laddr, char *lport, char *raddr, char *rport)
 {
 	struct suckaddr *sa = NULL;
@@ -387,40 +372,16 @@ vca_mk_tcp(const struct wrk_accept *wa,
 	VTCP_name(sa, laddr, VTCP_ADDRBUFSIZE, lport, VTCP_PORTBUFSIZE);
 }
 
-static void
-vca_mk_uds(struct wrk_accept *wa, struct sess *sp, char *laddr, char *lport,
-	   char *raddr, char *rport)
-{
-	struct suckaddr *sa = NULL;
-	ssize_t sz;
-
-	(void) wa;
-	AN(SES_Reserve_remote_addr(sp, &sa, &sz));
-	AN(sa);
-	assert(sz == vsa_suckaddr_len);
-	AZ(SES_Set_remote_addr(sp, bogo_ip));
-	sp->sattr[SA_CLIENT_ADDR] = sp->sattr[SA_REMOTE_ADDR];
-	sp->sattr[SA_LOCAL_ADDR] = sp->sattr[SA_REMOTE_ADDR];
-	sp->sattr[SA_SERVER_ADDR] = sp->sattr[SA_REMOTE_ADDR];
-	AN(SES_Set_String_Attr(sp, SA_CLIENT_IP, "0.0.0.0"));
-	AN(SES_Set_String_Attr(sp, SA_CLIENT_PORT, "0"));
-
-	strcpy(laddr, "0.0.0.0");
-	strcpy(raddr, "0.0.0.0");
-	strcpy(lport, "0");
-	strcpy(rport, "0");
-}
-
 static void v_matchproto_(task_func_t)
-vca_make_session(struct worker *wrk, void *arg)
+acc_tcp_make_session(struct worker *wrk, void *arg)
 {
-	struct sess *sp;
-	struct req *req;
-	struct wrk_accept *wa;
 	char laddr[VTCP_ADDRBUFSIZE];
 	char lport[VTCP_PORTBUFSIZE];
 	char raddr[VTCP_ADDRBUFSIZE];
 	char rport[VTCP_PORTBUFSIZE];
+	struct wrk_accept *wa;
+	struct sess *sp;
+	struct req *req;
 
 	CHECK_OBJ_NOTNULL(wrk, WORKER_MAGIC);
 	CAST_OBJ_NOTNULL(wa, arg, WRK_ACCEPT_MAGIC);
@@ -443,10 +404,7 @@ vca_make_session(struct worker *wrk, void *arg)
 
 	assert((size_t)wa->acceptaddrlen <= vsa_suckaddr_len);
 
-	if (wa->acceptlsock->uds)
-		vca_mk_uds(wa, sp, laddr, lport, raddr, rport);
-	else
-		vca_mk_tcp(wa, sp, laddr, lport, raddr, rport);
+	acc_mk_tcp(wa, sp, laddr, lport, raddr, rport);
 
 	AN(wa->acceptlsock->name);
 	VSL(SLT_Begin, sp->vxid, "sess 0 %s",
@@ -455,14 +413,15 @@ vca_make_session(struct worker *wrk, void *arg)
 	    raddr, rport, wa->acceptlsock->name, laddr, lport,
 	    sp->t_open, sp->fd);
 
-	vca_pace_good();
+	acc_pace_good();
 	wrk->stats->sess_conn++;
 
 	if (wa->acceptlsock->test_heritage) {
-		vca_sock_opt_test(wa->acceptlsock, sp);
+		acc_tcp_sockopt_test(wa->acceptlsock, sp);
 		wa->acceptlsock->test_heritage = 0;
 	}
-	vca_sock_opt_set(wa->acceptlsock, sp);
+
+	acc_tcp_sockopt_set(wa->acceptlsock, sp);
 
 	req = Req_New(sp);
 	CHECK_OBJ_NOTNULL(req, REQ_MAGIC);
@@ -481,19 +440,20 @@ vca_make_session(struct worker *wrk, void *arg)
  */
 
 static void v_matchproto_(task_func_t)
-vca_accept_task(struct worker *wrk, void *arg)
+acc_tcp_accept_task(struct worker *wrk, void *arg)
 {
-	struct wrk_accept wa;
-	struct poolsock *ps;
-	struct listen_sock *ls;
-	int i;
 	char laddr[VTCP_ADDRBUFSIZE];
 	char lport[VTCP_PORTBUFSIZE];
+	struct listen_sock *ls;
+	struct wrk_accept wa;
+	struct poolsock *ps;
+	int i;
 
 	CHECK_OBJ_NOTNULL(wrk, WORKER_MAGIC);
 	CAST_OBJ_NOTNULL(ps, arg, POOLSOCK_MAGIC);
 	ls = ps->lsock;
 	CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+	CHECK_OBJ_NOTNULL(ps->pool, POOL_MAGIC);
 
 	while (!pool_accepting)
 		VTIM_sleep(.1);
@@ -506,7 +466,7 @@ vca_accept_task(struct worker *wrk, void *arg)
 		INIT_OBJ(&wa, WRK_ACCEPT_MAGIC);
 		wa.acceptlsock = ls;
 
-		vca_pace_check();
+		acc_pace_check();
 
 		wa.acceptaddrlen = sizeof wa.acceptaddr;
 		do {
@@ -533,33 +493,28 @@ vca_accept_task(struct worker *wrk, void *arg)
 				break;
 			case EMFILE:
 				wrk->stats->sess_fail_emfile++;
-				vca_pace_bad();
+				acc_pace_bad();
 				break;
 			case EBADF:
 				wrk->stats->sess_fail_ebadf++;
-				vca_pace_bad();
+				acc_pace_bad();
 				break;
 			case ENOBUFS:
 			case ENOMEM:
 				wrk->stats->sess_fail_enomem++;
-				vca_pace_bad();
+				acc_pace_bad();
 				break;
 			default:
 				wrk->stats->sess_fail_other++;
-				vca_pace_bad();
+				acc_pace_bad();
 				break;
 			}
 
 			i = errno;
 			wrk->stats->sess_fail++;
 
-			if (wa.acceptlsock->uds) {
-				bstrcpy(laddr, "0.0.0.0");
-				bstrcpy(lport, "0");
-			} else {
-				VTCP_myname(ls->sock, laddr, VTCP_ADDRBUFSIZE,
-				    lport, VTCP_PORTBUFSIZE);
-			}
+			VTCP_myname(ls->sock, laddr, VTCP_ADDRBUFSIZE,
+			    lport, VTCP_PORTBUFSIZE);
 
 			VSL(SLT_SessError, NO_VXID, "%s %s %s %d %d \"%s\"",
 			    wa.acceptlsock->name, laddr, lport,
@@ -571,7 +526,7 @@ vca_accept_task(struct worker *wrk, void *arg)
 		wa.acceptsock = i;
 
 		if (!Pool_Task_Arg(wrk, TASK_QUEUE_REQ,
-		    vca_make_session, &wa, sizeof wa)) {
+		    acc_tcp_make_session, &wa, sizeof wa)) {
 			/*
 			 * We couldn't get another thread, so we will handle
 			 * the request in this worker thread, but first we
@@ -580,7 +535,7 @@ vca_accept_task(struct worker *wrk, void *arg)
 			 */
 			if (!ps->pool->die) {
 				AZ(Pool_Task(wrk->pool, ps->task,
-				    TASK_QUEUE_VCA));
+				    TASK_QUEUE_ACC));
 				return;
 			}
 		}
@@ -593,246 +548,84 @@ vca_accept_task(struct worker *wrk, void *arg)
 	FREE_OBJ(ps);
 }
 
-/*--------------------------------------------------------------------
- * Called when a worker and attached thread pool is created, to
- * allocate the tasks which will listen to sockets for that pool.
- */
-
-void
-VCA_NewPool(struct pool *pp)
+static void
+acc_tcp_accept(struct pool *pp)
 {
 	struct listen_sock *ls;
 	struct poolsock *ps;
 
-	VTAILQ_FOREACH(ls, &heritage.socks, list) {
+	VTAILQ_FOREACH(ls, &TCP_acceptor.socks, acclist) {
+		CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+
 		ALLOC_OBJ(ps, POOLSOCK_MAGIC);
 		AN(ps);
 		ps->lsock = ls;
-		ps->task->func = vca_accept_task;
+		ps->task->func = acc_tcp_accept_task;
 		ps->task->priv = ps;
 		ps->pool = pp;
 		VTAILQ_INSERT_TAIL(&pp->poolsocks, ps, list);
-		AZ(Pool_Task(pp, ps->task, TASK_QUEUE_VCA));
+		AZ(Pool_Task(pp, ps->task, TASK_QUEUE_ACC));
 	}
 }
 
-void
-VCA_DestroyPool(struct pool *pp)
-{
-	struct poolsock *ps;
-
-	while (!VTAILQ_EMPTY(&pp->poolsocks)) {
-		ps = VTAILQ_FIRST(&pp->poolsocks);
-		VTAILQ_REMOVE(&pp->poolsocks, ps, list);
-	}
-}
-
-/*--------------------------------------------------------------------*/
-
-static void * v_matchproto_()
-vca_acct(void *arg)
-{
-	struct listen_sock *ls;
-	vtim_real t0;
-
-	// XXX Actually a mis-nomer now because the accept happens in a pool
-	// thread. Rename to accept-nanny or so?
-	THR_SetName("cache-acceptor");
-	THR_Init();
-	(void)arg;
-
-	t0 = VTIM_real();
-	vca_periodic(t0);
-
-	pool_accepting = 1;
-
-	while (1) {
-		(void)sleep(1);
-		if (vca_sock_opt_init()) {
-			PTOK(pthread_mutex_lock(&shut_mtx));
-			VTAILQ_FOREACH(ls, &heritage.socks, list) {
-				if (ls->sock == -2)
-					continue;	// VCA_Shutdown
-				assert (ls->sock > 0);
-				vca_sock_opt_set(ls, NULL);
-				/* If one of the options on a socket has
-				 * changed, also force a retest of whether
-				 * the values are inherited to the
-				 * accepted sockets. This should then
-				 * catch any false positives from previous
-				 * tests that could happen if the set
-				 * value of an option happened to just be
-				 * the OS default for that value, and
-				 * wasn't actually inherited from the
-				 * listening socket. */
-				ls->test_heritage = 1;
-			}
-			PTOK(pthread_mutex_unlock(&shut_mtx));
-		}
-		vca_periodic(t0);
-	}
-	NEEDLESS(return (NULL));
-}
-
-/*--------------------------------------------------------------------*/
-
-static void v_matchproto_(cli_func_t)
-ccf_start(struct cli *cli, const char * const *av, void *priv)
+static void
+acc_tcp_update(pthread_mutex_t *shut_mtx)
 {
 	struct listen_sock *ls;
 
-	(void)cli;
-	(void)av;
-	(void)priv;
+	if (!acc_tcp_sockopt_init())
+		return;
 
-	(void)vca_sock_opt_init();
+	PTOK(pthread_mutex_lock(shut_mtx));
 
-	VTAILQ_FOREACH(ls, &heritage.socks, list) {
-		CHECK_OBJ_NOTNULL(ls->transport, TRANSPORT_MAGIC);
-		assert (ls->sock > 0);	// We know where stdin is
-		if (cache_param->tcp_fastopen &&
-		    VTCP_fastopen(ls->sock, cache_param->listen_depth))
-			VSL(SLT_Error, NO_VXID,
-			    "Kernel TCP Fast Open: sock=%d, errno=%d %s",
-			    ls->sock, errno, VAS_errtxt(errno));
-		if (listen(ls->sock, cache_param->listen_depth)) {
-			VCLI_SetResult(cli, CLIS_CANT);
-			VCLI_Out(cli, "Listen failed on socket '%s': %s",
-			    ls->endpoint, VAS_errtxt(errno));
-			return;
-		}
-		AZ(ls->conn_heritage);
-		ls->conn_heritage = calloc(n_sock_opts,
-		    sizeof *ls->conn_heritage);
-		AN(ls->conn_heritage);
+	VTAILQ_FOREACH(ls, &TCP_acceptor.socks, acclist) {
+		CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+
+		if (ls->sock == -2)
+			continue;	// ACC_Shutdown
+		assert (ls->sock > 0);
+		acc_tcp_sockopt_set(ls, NULL);
+		/* If one of the options on a socket has
+		 * changed, also force a retest of whether
+		 * the values are inherited to the
+		 * accepted sockets. This should then
+		 * catch any false positives from previous
+		 * tests that could happen if the set
+		 * value of an option happened to just be
+		 * the OS default for that value, and
+		 * wasn't actually inherited from the
+		 * listening socket. */
 		ls->test_heritage = 1;
-		vca_sock_opt_set(ls, NULL);
-		if (cache_param->accept_filter && VTCP_filter_http(ls->sock))
-			VSL(SLT_Error, NO_VXID,
-			    "Kernel filtering: sock=%d, errno=%d %s",
-			    ls->sock, errno, VAS_errtxt(errno));
 	}
 
-	PTOK(pthread_create(&VCA_thread, NULL, vca_acct, NULL));
+	PTOK(pthread_mutex_unlock(shut_mtx));
 }
 
-/*--------------------------------------------------------------------*/
-
-static void v_matchproto_(cli_func_t)
-ccf_listen_address(struct cli *cli, const char * const *av, void *priv)
-{
-	struct listen_sock *ls;
-	char h[VTCP_ADDRBUFSIZE], p[VTCP_PORTBUFSIZE];
-
-	(void)cli;
-	(void)av;
-	(void)priv;
-
-	/*
-	 * This CLI command is primarily used by varnishtest.  Don't
-	 * respond until listen(2) has been called, in order to avoid
-	 * a race where varnishtest::client would attempt to connect(2)
-	 * before listen(2) has been called.
-	 */
-	while (!pool_accepting)
-		VTIM_sleep(.1);
-
-	PTOK(pthread_mutex_lock(&shut_mtx));
-	VTAILQ_FOREACH(ls, &heritage.socks, list) {
-		if (!ls->uds) {
-			VTCP_myname(ls->sock, h, sizeof h, p, sizeof p);
-			VCLI_Out(cli, "%s %s %s\n", ls->name, h, p);
-		}
-		else
-			VCLI_Out(cli, "%s %s -\n", ls->name, ls->endpoint);
-	}
-	PTOK(pthread_mutex_unlock(&shut_mtx));
-}
-
-/*--------------------------------------------------------------------*/
-
-static struct cli_proto vca_cmds[] = {
-	{ CLICMD_SERVER_START,		"", ccf_start },
-	{ CLICMD_DEBUG_LISTEN_ADDRESS,	"d", ccf_listen_address },
-	{ NULL }
-};
-
-void
-VCA_Init(void)
-{
-
-	CLI_AddFuncs(vca_cmds);
-	Lck_New(&pace_mtx, lck_vcapace);
-}
-
-void
-VCA_Shutdown(void)
+static void
+acc_tcp_shutdown(void)
 {
 	struct listen_sock *ls;
 	int i;
 
-	PTOK(pthread_mutex_lock(&shut_mtx));
-	VTAILQ_FOREACH(ls, &heritage.socks, list) {
+	VTAILQ_FOREACH(ls, &TCP_acceptor.socks, acclist) {
+		CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+
 		i = ls->sock;
 		ls->sock = -2;
 		(void)close(i);
 	}
-	PTOK(pthread_mutex_unlock(&shut_mtx));
 }
 
-/*--------------------------------------------------------------------
- * Transport protocol registration
- *
- */
-
-static VTAILQ_HEAD(,transport)	transports =
-    VTAILQ_HEAD_INITIALIZER(transports);
-
-static uint16_t next_xport;
-
-static void
-XPORT_Register(struct transport *xp)
-{
-
-	CHECK_OBJ_NOTNULL(xp, TRANSPORT_MAGIC);
-	AZ(xp->number);
-
-	xp->number = ++next_xport;
-	VTAILQ_INSERT_TAIL(&transports, xp, list);
-}
-
-void
-XPORT_Init(void)
-{
-
-	ASSERT_MGT();
-
-#define TRANSPORT_MACRO(name) XPORT_Register(&name##_transport);
-	TRANSPORTS
-#undef TRANSPORT_MACRO
-}
-
-const struct transport *
-XPORT_Find(const char *name)
-{
-	const struct transport *xp;
-
-	ASSERT_MGT();
-
-	VTAILQ_FOREACH(xp, &transports, list)
-		if (xp->proto_ident != NULL &&
-		    !strcasecmp(xp->proto_ident, name))
-			return (xp);
-	return (NULL);
-}
-
-const struct transport *
-XPORT_ByNumber(uint16_t no)
-{
-	const struct transport *xp;
-
-	VTAILQ_FOREACH(xp, &transports, list)
-		if (xp->number == no)
-			return (xp);
-	return (NULL);
-}
+struct acceptor TCP_acceptor = {
+	.magic		= ACCEPTOR_MAGIC,
+	.name		= "tcp",
+	.config		= acc_tcp_config,
+	.init		= acc_tcp_init,
+	.open		= acc_tcp_open,
+	.reopen		= acc_tcp_reopen,
+	.start		= acc_tcp_start,
+	.event		= acc_tcp_event,
+	.accept		= acc_tcp_accept,
+	.update		= acc_tcp_update,
+	.shutdown	= acc_tcp_shutdown,
+};

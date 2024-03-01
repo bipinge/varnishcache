@@ -1,6 +1,6 @@
 /*-
  * Copyright (c) 2006 Verdens Gang AS
- * Copyright (c) 2006-2011 Varnish Software AS
+ * Copyright (c) 2006-2015 Varnish Software AS
  * All rights reserved.
  *
  * Author: Poul-Henning Kamp <phk@phk.freebsd.dk>
@@ -28,41 +28,53 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * Private include file for the pool aware code.
  */
 
-VTAILQ_HEAD(taskhead, pool_task);
+/* cache_acceptor.c */
+struct listen_sock;
+struct listen_arg;
+struct pool;
 
-struct poolsock;
+void ACC_Init(void);
+void ACC_Start(struct cli *cli);
+void ACC_Shutdown(void);
 
-struct pool {
-	unsigned			magic;
-#define POOL_MAGIC			0x606658fa
-	VTAILQ_ENTRY(pool)		list;
-	VTAILQ_HEAD(,poolsock)		poolsocks;
-
-	int				die;
-	pthread_cond_t			herder_cond;
-	pthread_t			herder_thr;
-
-	struct lock			mtx;
-	unsigned			nidle;
-	struct taskhead			idle_queue;
-	struct taskhead			queues[TASK_QUEUE_RESERVE];
-	unsigned			nthr;
-	unsigned			lqueue;
-	uintmax_t			ndequeued;
-	struct VSC_main_pool		stats[1];
-	struct VSC_main_wrk		*a_stat;
-	struct VSC_main_wrk		*b_stat;
-
-	struct mempool			*mpl_req;
-	struct mempool			*mpl_sess;
-	struct waiter			*waiter;
+enum acc_event {
+	ACC_EVENT_LADDR,
 };
 
-void *pool_herder(void*);
-task_func_t pool_stat_summ;
-extern struct lock			pool_mtx;
-void ACC_NewPool(struct pool *);
-void ACC_DestroyPool(struct pool *);
+typedef int acceptor_config_f(void);
+typedef void acceptor_init_f(void);
+typedef int acceptor_open_f(char **, struct listen_arg *,
+    const char **);
+typedef int acceptor_reopen_f(void);
+typedef void acceptor_start_f(struct cli *);
+typedef void acceptor_event_f(struct cli *, struct listen_sock *,
+    enum acc_event);
+typedef void acceptor_accept_f(struct pool *);
+typedef void acceptor_update_f(pthread_mutex_t *);
+typedef void acceptor_shutdown_f(void);
+
+struct acceptor {
+	unsigned			magic;
+#define ACCEPTOR_MAGIC			0x0611847c
+	VTAILQ_ENTRY(acceptor)		list;
+	VTAILQ_HEAD(,listen_sock)	socks;
+	const char			*name;
+
+	acceptor_config_f		*config;
+	acceptor_init_f			*init;
+	acceptor_open_f			*open;
+	acceptor_reopen_f		*reopen;
+	acceptor_start_f		*start;
+	acceptor_event_f		*event;
+	acceptor_accept_f		*accept;
+	acceptor_update_f		*update;
+	acceptor_shutdown_f		*shutdown;
+};
+
+#define ACC_Foreach(arg) for (arg = NULL; ACC__iter(&arg);)
+int ACC__iter(struct acceptor ** const pp);
+
+extern struct acceptor TCP_acceptor;
+extern struct acceptor UDS_acceptor;

@@ -1,6 +1,6 @@
 /*-
  * Copyright (c) 2006 Verdens Gang AS
- * Copyright (c) 2006-2011 Varnish Software AS
+ * Copyright (c) 2006-2015 Varnish Software AS
  * All rights reserved.
  *
  * Author: Poul-Henning Kamp <phk@phk.freebsd.dk>
@@ -28,41 +28,36 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * Private include file for the pool aware code.
  */
 
-VTAILQ_HEAD(taskhead, pool_task);
+struct sockaddr_storage;
+struct pool_task;
 
-struct poolsock;
+struct wrk_accept {
+	unsigned		magic;
+#define WRK_ACCEPT_MAGIC	0x8c4b4d59
 
-struct pool {
-	unsigned			magic;
-#define POOL_MAGIC			0x606658fa
-	VTAILQ_ENTRY(pool)		list;
-	VTAILQ_HEAD(,poolsock)		poolsocks;
-
-	int				die;
-	pthread_cond_t			herder_cond;
-	pthread_t			herder_thr;
-
-	struct lock			mtx;
-	unsigned			nidle;
-	struct taskhead			idle_queue;
-	struct taskhead			queues[TASK_QUEUE_RESERVE];
-	unsigned			nthr;
-	unsigned			lqueue;
-	uintmax_t			ndequeued;
-	struct VSC_main_pool		stats[1];
-	struct VSC_main_wrk		*a_stat;
-	struct VSC_main_wrk		*b_stat;
-
-	struct mempool			*mpl_req;
-	struct mempool			*mpl_sess;
-	struct waiter			*waiter;
+	/* Accept stuff */
+	struct sockaddr_storage	acceptaddr;
+	socklen_t		acceptaddrlen;
+	int			acceptsock;
+	struct listen_sock	*acceptlsock;
 };
 
-void *pool_herder(void*);
-task_func_t pool_stat_summ;
-extern struct lock			pool_mtx;
-void ACC_NewPool(struct pool *);
-void ACC_DestroyPool(struct pool *);
+struct poolsock {
+	unsigned			magic;
+#define POOLSOCK_MAGIC			0x1b0a2d38
+	VTAILQ_ENTRY(poolsock)		list;
+	struct listen_sock		*lsock;
+	struct pool_task		task[1];
+	struct pool			*pool;
+};
+
+struct conn_heritage {
+	unsigned	sess_set;
+	unsigned	listen_mod;
+};
+
+void acc_pace_check(void);
+void acc_pace_bad(void);
+void acc_pace_good(void);

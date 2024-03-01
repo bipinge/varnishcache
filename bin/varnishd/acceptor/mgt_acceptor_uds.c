@@ -1,9 +1,10 @@
 /*-
  * Copyright (c) 2006 Verdens Gang AS
- * Copyright (c) 2006-2015 Varnish Software AS
+ * Copyright (c) 2006-2023 Varnish Software AS
  * All rights reserved.
  *
  * Author: Poul-Henning Kamp <phk@phk.freebsd.dk>
+ * Author: Asad Sajjad Ahmed <asadsa@varnish-software.com>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  *
@@ -47,61 +48,50 @@
 #include "mgt/mgt.h"
 #include "common/heritage.h"
 
+#include "acceptor/cache_acceptor.h"
+#include "acceptor/acceptor_uds.h"
+#include "acceptor/mgt_acceptor.h"
+
 #include "vav.h"
 #include "vcli_serve.h"
 #include "vsa.h"
 #include "vss.h"
-#include "vtcp.h"
 #include "vus.h"
 
-struct listen_arg {
-	unsigned			magic;
-#define LISTEN_ARG_MAGIC		0xbb2fc333
-	VTAILQ_ENTRY(listen_arg)	list;
-	const char			*endpoint;
-	const char			*name;
-	VTAILQ_HEAD(,listen_sock)	socks;
-	const struct transport		*transport;
-	const struct uds_perms		*perms;
-};
+int
+acc_uds_config(void)
+{
 
-struct uds_perms {
-	unsigned	magic;
-#define UDS_PERMS_MAGIC 0x84fb5635
-	mode_t		mode;
-	uid_t		uid;
-	gid_t		gid;
-};
-
-static VTAILQ_HEAD(,listen_arg) listen_args =
-    VTAILQ_HEAD_INITIALIZER(listen_args);
+	return (0);
+}
 
 static int
-mac_vus_bind(void *priv, const struct sockaddr_un *uds)
+acc_vus_bind(void *priv, const struct sockaddr_un *uds)
 {
 	return (VUS_bind(uds, priv));
 }
 
 static int
-mac_opensocket(struct listen_sock *ls)
+acc_uds_opensocket(struct listen_sock *ls)
 {
 	int fail;
 	const char *err;
 
 	CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+
 	if (ls->sock > 0) {
 		MCH_Fd_Inherit(ls->sock, NULL);
 		closefd(&ls->sock);
 	}
-	if (!ls->uds)
-		ls->sock = VTCP_bind(ls->addr, NULL);
-	else
-		ls->sock = VUS_resolver(ls->endpoint, mac_vus_bind, NULL, &err);
+
+	ls->sock = VUS_resolver(ls->endpoint, acc_vus_bind, NULL, &err);
 	fail = errno;
+
 	if (ls->sock < 0) {
 		AN(fail);
 		return (fail);
 	}
+
 	if (ls->perms != NULL) {
 		CHECK_OBJ(ls->perms, UDS_PERMS_MAGIC);
 		assert(ls->uds);
@@ -112,56 +102,48 @@ mac_opensocket(struct listen_sock *ls)
 		if (chown(ls->endpoint, ls->perms->uid, ls->perms->gid) != 0)
 			return (errno);
 	}
+
 	MCH_Fd_Inherit(ls->sock, "sock");
 	return (0);
 }
 
-/*=====================================================================
- * Reopen the accept sockets to get rid of listen status.
- * returns the highest errno encountered, 0 for success
- */
-
-int
-MAC_reopen_sockets(void)
+static int v_matchproto_(vus_resolved_f)
+acc_uds_open_cb(void *priv, const struct sockaddr_un *uds)
 {
-	struct listen_sock *ls;
-	int err, fail = 0;
-
-	VTAILQ_FOREACH(ls, &heritage.socks, list) {
-		VJ_master(JAIL_MASTER_PRIVPORT);
-		err = mac_opensocket(ls);
-		VJ_master(JAIL_MASTER_LOW);
-		if (err == 0)
-			continue;
-		fail = vmax(fail, err);
-		MGT_Complain(C_ERR,
-		    "Could not reopen listen socket %s: %s",
-		    ls->endpoint, VAS_errtxt(err));
-	}
-	return (fail);
-}
-
-/*--------------------------------------------------------------------*/
-
-static struct listen_sock *
-mk_listen_sock(const struct listen_arg *la, const struct suckaddr *sa)
-{
+	struct listen_arg *la;
 	struct listen_sock *ls;
 	int fail;
 
+	CAST_OBJ_NOTNULL(la, priv, LISTEN_ARG_MAGIC);
+	(void) uds;
+
+	VTAILQ_FOREACH(ls, &UDS_acceptor.socks, acclist) {
+		CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+
+		if (strcmp(ls->endpoint, la->endpoint) == 0)
+			ARGV_ERR("-a arguments %s and %s have same address\n",
+			    ls->endpoint, la->endpoint);
+	}
+
 	ALLOC_OBJ(ls, LISTEN_SOCK_MAGIC);
 	AN(ls);
+
 	ls->sock = -1;
-	ls->addr = VSA_Clone(sa);
+	ls->acc = &UDS_acceptor;
+
+	ls->addr = VSA_Clone(bogo_ip);
 	AN(ls->addr);
+
 	REPLACE(ls->endpoint, la->endpoint);
 	ls->name = la->name;
 	ls->transport = la->transport;
 	ls->perms = la->perms;
-	ls->uds = VUS_is(la->endpoint);
+	ls->uds = 1;
+
 	VJ_master(JAIL_MASTER_PRIVPORT);
-	fail = mac_opensocket(ls);
+	fail = acc_uds_opensocket(ls);
 	VJ_master(JAIL_MASTER_LOW);
+
 	if (fail) {
 		VSA_free(&ls->addr);
 		free(ls->endpoint);
@@ -169,112 +151,35 @@ mk_listen_sock(const struct listen_arg *la, const struct suckaddr *sa)
 		if (fail != EAFNOSUPPORT)
 			ARGV_ERR("Could not get socket %s: %s\n",
 			    la->endpoint, VAS_errtxt(fail));
-		return (NULL);
-	}
-	return (ls);
-}
-
-static int v_matchproto_(vss_resolved_f)
-mac_tcp(void *priv, const struct suckaddr *sa)
-{
-	struct listen_arg *la;
-	struct listen_sock *ls;
-	char abuf[VTCP_ADDRBUFSIZE], pbuf[VTCP_PORTBUFSIZE];
-	char nbuf[VTCP_ADDRBUFSIZE+VTCP_PORTBUFSIZE+2];
-
-	CAST_OBJ_NOTNULL(la, priv, LISTEN_ARG_MAGIC);
-
-	VTAILQ_FOREACH(ls, &heritage.socks, list) {
-		if (!ls->uds && !VSA_Compare(sa, ls->addr))
-			ARGV_ERR("-a arguments %s and %s have same address\n",
-			    ls->endpoint, la->endpoint);
-	}
-	ls = mk_listen_sock(la, sa);
-	if (ls == NULL)
 		return (0);
-	AZ(ls->uds);
-	if (VSA_Port(ls->addr) == 0) {
-		/*
-		 * If the argv port number is zero, we adopt whatever
-		 * port number this VTCP_bind() found us, as if
-		 * it was specified by the argv.
-		 */
-		VSA_free(&ls->addr);
-		ls->addr = VTCP_my_suckaddr(ls->sock);
-		VTCP_myname(ls->sock, abuf, sizeof abuf,
-		    pbuf, sizeof pbuf);
-		if (VSA_Get_Proto(sa) == AF_INET6)
-			bprintf(nbuf, "[%s]:%s", abuf, pbuf);
-		else
-			bprintf(nbuf, "%s:%s", abuf, pbuf);
-		REPLACE(ls->endpoint, nbuf);
 	}
+
 	VTAILQ_INSERT_TAIL(&la->socks, ls, arglist);
 	VTAILQ_INSERT_TAIL(&heritage.socks, ls, list);
+	VTAILQ_INSERT_TAIL(&UDS_acceptor.socks, ls, acclist);
+
 	return (0);
 }
 
-static int v_matchproto_(vus_resolved_f)
-mac_uds(void *priv, const struct sockaddr_un *uds)
+int
+acc_uds_open(char **av, struct listen_arg *la, const char **err)
 {
-	struct listen_arg *la;
-	struct listen_sock *ls;
 
-	CAST_OBJ_NOTNULL(la, priv, LISTEN_ARG_MAGIC);
-	(void) uds;
-
-	VTAILQ_FOREACH(ls, &heritage.socks, list) {
-		if (ls->uds && strcmp(ls->endpoint, la->endpoint) == 0)
-			ARGV_ERR("-a arguments %s and %s have same address\n",
-			    ls->endpoint, la->endpoint);
-	}
-	ls = mk_listen_sock(la, bogo_ip);
-	if (ls == NULL)
-		return (0);
-	AN(ls->uds);
-	VTAILQ_INSERT_TAIL(&la->socks, ls, arglist);
-	VTAILQ_INSERT_TAIL(&heritage.socks, ls, list);
-	return (0);
-}
-
-void
-MAC_Arg(const char *spec)
-{
-	char **av;
-	struct listen_arg *la;
-	const char *err;
-	int error;
 	const struct transport *xp = NULL;
-	const char *name;
-	char name_buf[8];
-	static unsigned seq = 0;
 	struct passwd *pwd = NULL;
 	struct group *grp = NULL;
-	mode_t mode = 0;
 	struct uds_perms *perms;
+	mode_t mode = 0;
 
-	av = MGT_NamedArg(spec, &name, "-a");
+	CHECK_OBJ_NOTNULL(la, LISTEN_ARG_MAGIC);
 	AN(av);
-
-	ALLOC_OBJ(la, LISTEN_ARG_MAGIC);
-	AN(la);
-	VTAILQ_INIT(&la->socks);
-	VTAILQ_INSERT_TAIL(&listen_args, la, list);
-	la->endpoint = av[1];
-
-	if (name == NULL) {
-		bprintf(name_buf, "a%u", seq++);
-		name = strdup(name_buf);
-		AN(name);
-	}
-	la->name = name;
+	AN(err);
 
 	if (*la->endpoint != '/' && strchr(la->endpoint, '/') != NULL)
 		ARGV_ERR("Unix domain socket addresses must be"
 		    " absolute paths in -a (%s)\n", la->endpoint);
 
-	if (VUS_is(la->endpoint) && heritage.min_vcl_version < 41)
-		heritage.min_vcl_version = 41;
+	heritage.min_vcl_version = vmax(heritage.min_vcl_version, 41U);
 
 	for (int i = 2; av[i] != NULL; i++) {
 		char *eq, *val;
@@ -348,6 +253,7 @@ MAC_Arg(const char *spec)
 
 	if (xp == NULL)
 		xp = XPORT_Find("http");
+
 	AN(xp);
 	la->transport = xp;
 
@@ -365,15 +271,30 @@ MAC_Arg(const char *spec)
 		perms->mode = mode;
 		la->perms = perms;
 	}
-	else
-		AZ(la->perms);
 
-	if (VUS_is(la->endpoint))
-		error = VUS_resolver(av[1], mac_uds, la, &err);
-	else
-		error = VSS_resolver(av[1], "80", mac_tcp, la, &err);
+	return (VUS_resolver(la->endpoint, acc_uds_open_cb, la, err));
+}
 
-	if (VTAILQ_EMPTY(&la->socks) || error)
-		ARGV_ERR("Got no socket(s) for %s\n", av[1]);
-	VAV_Free(av);
+int
+acc_uds_reopen(void)
+{
+	struct listen_sock *ls;
+	int err, fail = 0;
+
+	VTAILQ_FOREACH(ls, &UDS_acceptor.socks, acclist) {
+		CHECK_OBJ_NOTNULL(ls, LISTEN_SOCK_MAGIC);
+
+		VJ_master(JAIL_MASTER_PRIVPORT);
+		err = acc_uds_opensocket(ls);
+		VJ_master(JAIL_MASTER_LOW);
+
+		if (err == 0)
+			continue;
+
+		fail = vmax(fail, err);
+		MGT_Complain(C_ERR, "Could not reopen listen socket %s: %s",
+		    ls->endpoint, VAS_errtxt(err));
+	}
+
+	return (fail);
 }

@@ -44,6 +44,7 @@ struct listen_sock {
 #define LISTEN_SOCK_MAGIC		0x999e4b57
 	VTAILQ_ENTRY(listen_sock)	list;
 	VTAILQ_ENTRY(listen_sock)	arglist;
+	VTAILQ_ENTRY(listen_sock)	acclist;
 	int				sock;
 	int				uds;
 	char				*endpoint;
@@ -53,6 +54,7 @@ struct listen_sock {
 	const struct uds_perms		*perms;
 	unsigned			test_heritage;
 	struct conn_heritage		*conn_heritage;
+	struct acceptor			*acc;
 };
 
 VTAILQ_HEAD(listen_sock_head, listen_sock);
@@ -115,7 +117,7 @@ void child_main(int, size_t);
 /* cache/cache_vcl.c */
 int VCL_TestLoad(const char *);
 
-/* cache/cache_acceptor.c */
+/* acceptor/cache_acceptor.c */
 struct transport;
 void XPORT_Init(void);
 const struct transport *XPORT_Find(const char *name);

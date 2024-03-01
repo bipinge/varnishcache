@@ -28,41 +28,23 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * Private include file for the pool aware code.
  */
 
-VTAILQ_HEAD(taskhead, pool_task);
+/* mgt_acceptor.c */
 
-struct poolsock;
-
-struct pool {
+struct listen_arg {
 	unsigned			magic;
-#define POOL_MAGIC			0x606658fa
-	VTAILQ_ENTRY(pool)		list;
-	VTAILQ_HEAD(,poolsock)		poolsocks;
-
-	int				die;
-	pthread_cond_t			herder_cond;
-	pthread_t			herder_thr;
-
-	struct lock			mtx;
-	unsigned			nidle;
-	struct taskhead			idle_queue;
-	struct taskhead			queues[TASK_QUEUE_RESERVE];
-	unsigned			nthr;
-	unsigned			lqueue;
-	uintmax_t			ndequeued;
-	struct VSC_main_pool		stats[1];
-	struct VSC_main_wrk		*a_stat;
-	struct VSC_main_wrk		*b_stat;
-
-	struct mempool			*mpl_req;
-	struct mempool			*mpl_sess;
-	struct waiter			*waiter;
+#define LISTEN_ARG_MAGIC		0xbb2fc333
+	VTAILQ_ENTRY(listen_arg)	list;
+	const char			*endpoint;
+	const char			*name;
+	VTAILQ_HEAD(,listen_sock)	socks;
+	const struct transport		*transport;
+	const struct uds_perms		*perms;
 };
 
-void *pool_herder(void*);
-task_func_t pool_stat_summ;
-extern struct lock			pool_mtx;
-void ACC_NewPool(struct pool *);
-void ACC_DestroyPool(struct pool *);
+void ACC_Add(struct acceptor *acc);
+void ACC_Config(void);
+
+void ACC_Arg(const char *);
+int ACC_reopen_sockets(void);
