@@ -304,7 +304,7 @@ vtc_log_VAS_Fail(const char *func, const char *file, int line,
 	(void)why;
 
 	if (VBT_dump(sizeof buf, buf) < 0) {
-		fprintf(stderr, "Failed to print backtrace: %d (%s)\n",
+		bprintf(buf, "Failed to print backtrace: %d (%s)\n",
 		    errno, strerror(errno));
 	}
 
