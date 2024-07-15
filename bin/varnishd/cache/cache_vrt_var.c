@@ -590,10 +590,10 @@ REQ_VAR_R(backend_hint, director_hint, VCL_BACKEND)
 
 REQ_VAR_L(ttl, d_ttl, VCL_DURATION, if (!(arg>0.0)) arg = 0;)
 REQ_VAR_R(ttl, d_ttl, VCL_DURATION)
-REQ_VAR_U(ttl, d_ttl, -1)
+REQ_VAR_U(ttl, d_ttl, NAN)
 REQ_VAR_L(grace, d_grace, VCL_DURATION, if (!(arg>0.0)) arg = 0;)
 REQ_VAR_R(grace, d_grace, VCL_DURATION)
-REQ_VAR_U(grace, d_grace, -1)
+REQ_VAR_U(grace, d_grace, NAN)
 
 VCL_VOID
 VRT_l_req_backend_hint(VRT_CTX, VCL_BACKEND be)

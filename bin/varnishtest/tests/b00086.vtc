@@ -2,12 +2,12 @@ varnishtest "unset req.ttl and req.grace"
 
 server s1 {
 	rxreq
-	expect req.http.ttl-initial == -1.000
-	expect req.http.grace-initial == -1.000
+	expect req.http.ttl-initial == "NAN"
+	expect req.http.grace-initial == "NAN"
 	expect req.http.ttl-set == 0.000
 	expect req.http.grace-set == 0.000
-	expect req.http.ttl-unset == -1.000
-	expect req.http.grace-unset == -1.000
+	expect req.http.ttl-unset == "NAN"
+	expect req.http.grace-unset == "NAN"
 	txresp
 } -start
 
