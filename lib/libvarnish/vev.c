@@ -59,7 +59,6 @@ struct vevsig {
 	struct vev		*vev;
 	struct sigaction	sigact;
 	unsigned char		happened;
-	siginfo_t		siginfo[1];
 };
 
 static struct vevsig		*vev_sigs;
@@ -186,8 +185,7 @@ vev_sigaction(int sig, siginfo_t *siginfo, void *ctx)
 	es = &vev_sigs[sig];
 	if (!es->happened) {
 		es->vevb->psig++;
-		memcpy(es->siginfo, siginfo, sizeof *es->siginfo);
-		es->vev->siginfo = es->siginfo;
+		memcpy(es->vev->siginfo, siginfo, sizeof *es->vev->siginfo);
 	}
 	es->happened = 1;
 }
@@ -404,10 +402,7 @@ vev_sched_signal(struct vev_root *evb)
 		e = es->vev;
 		assert(e != NULL);
 		i = e->callback(e, VEV__SIG);
-		if (e->siginfo != NULL) {
-			e->siginfo = NULL;
-			memset(es->siginfo, 0, sizeof *es->siginfo);
-		}
+		memset(e->siginfo, 0, sizeof *es->vev->siginfo);
 		if (i) {
 			VEV_Stop(evb, e);
 			free(e);
